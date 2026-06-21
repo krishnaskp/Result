@@ -1,0 +1,180 @@
+// ApniRank - Cloudflare Worker Proxy Engine
+
+const API_BASE_RESULT = "https://search.rjexamresults.com";
+const API_BASE_DATA = "https://data.rjexamresults.com";
+
+// CORS Headers - ताकि आपकी वेबसाइट इस API को कॉल कर सके
+const corsHeaders = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+};
+
+// हेल्पर फंक्शन: मार्क्स फॉर्मेटिंग
+const fmtMarks = (v) => {
+    const n = parseFloat(v);
+    return !isNaN(n) ? n.toFixed(4) : "0.0000";
+};
+
+// हेल्पर फंक्शन: TSP स्टेटस से मोड (tsp/ntsp) निकालना
+const getModeFromTsp = (status) => {
+    if (!status) return "ntsp";
+    const s = String(status).toUpperCase();
+    if (s.includes("NON")) return "ntsp";
+    if (s.includes("TSP")) return "tsp";
+    return "ntsp";
+};
+
+export default {
+    async fetch(request, env, ctx) {
+        // OPTIONS रिक्वेस्ट (CORS Preflight) को हैंडल करें
+        if (request.method === "OPTIONS") {
+            return new Response(null, { headers: corsHeaders });
+        }
+
+        const url = new URL(request.url);
+
+        // --- डिफ़ॉल्ट रूट (चेक करने के लिए कि वर्कर चल रहा है या नहीं) ---
+        if (url.pathname === "/") {
+            return new Response("ApniRank Cloudflare Engine is Running 🚀", { 
+                status: 200, 
+                headers: { "Content-Type": "text/plain", ...corsHeaders } 
+            });
+        }
+
+        // --- मुख्य API रूट ---
+        if (url.pathname === "/api/v2/process-exam") {
+            const roll = url.searchParams.get("roll");
+            const examResultCode = url.searchParams.get("examResultCode");
+            const datasetKey = url.searchParams.get("datasetKey");
+
+            // वैलिडेशन
+            if (!roll || !examResultCode || !datasetKey) {
+                return new Response(JSON.stringify({ ok: false, error: "Missing required parameters: roll, examResultCode, datasetKey" }), {
+                    status: 400,
+                    headers: { "Content-Type": "application/json", ...corsHeaders }
+                });
+            }
+
+            try {
+                // --------------------------------------------------
+                // चरण 1: Result API (System 1) से डेटा लाना
+                // --------------------------------------------------
+                const resultUrl = `${API_BASE_RESULT}/api/result?exam=${examResultCode}&roll=${roll}`;
+                const res1 = await fetch(resultUrl, { headers: { 'User-Agent': 'ApniRankCFWorker/1.0' } });
+                
+                if (!res1.ok) throw new Error(`Upstream Result API error: ${res1.status}`);
+                const data1 = await res1.json();
+
+                if (!data1.results || data1.results.length === 0) {
+                    return new Response(JSON.stringify({ ok: false, error: "Candidate not found in source." }), { 
+                        status: 404, headers: { "Content-Type": "application/json", ...corsHeaders } 
+                    });
+                }
+
+                const cand = data1.results[0];
+                const stateRank = parseInt(cand.rank);
+                const category = cand.category || "N/A";
+                const tspStatus = cand.tsp || "NTSP";
+                const mode = getModeFromTsp(tspStatus);
+
+                if (isNaN(stateRank) || stateRank <= 0) {
+                    return new Response(JSON.stringify({ ok: false, error: "Invalid rank data from source." }), { 
+                        status: 500, headers: { "Content-Type": "application/json", ...corsHeaders } 
+                    });
+                }
+
+                // --------------------------------------------------
+                // चरण 2: Merit API (System 2) से काउंट्स लाना
+                // --------------------------------------------------
+                const meritUrl = `${API_BASE_DATA}/api/merit/result?dataset=${datasetKey}&mode=${mode}&category=${encodeURIComponent(category)}&start=1&end=${stateRank}&emask=0&exclude=&include_overlap=1`;
+                
+                const res2 = await fetch(meritUrl, { headers: { 'User-Agent': 'ApniRankCFWorker/1.0' } });
+                
+                if (!res2.ok) throw new Error(`Upstream Merit API error: ${res2.status}`);
+                const data2 = await res2.json();
+
+                if (!data2.ok || !data2.cat_counts || !data2.all_counts) {
+                    return new Response(JSON.stringify({ ok: false, error: "Failed to fetch counts from source." }), { 
+                        status: 500, headers: { "Content-Type": "application/json", ...corsHeaders } 
+                    });
+                }
+
+                // --------------------------------------------------
+                // चरण 3: डेटा को प्रोसेस और क्लीन करना
+                // --------------------------------------------------
+                const cleanCandidate = {
+                    roll: cand.roll,
+                    name: cand.name || "N/A",
+                    father: cand.father || "N/A",
+                    mother: cand.mother || "N/A",
+                    category: category,
+                    gender_area: `${cand.gender || '-'} / ${tspStatus}`,
+                    state_rank: stateRank,
+                    norm_marks: fmtMarks(cand.norm_marks || cand.raw_marks)
+                };
+
+                // TSP ओपन पूल लॉजिक
+                let tspOpenPoolData = null;
+                if (mode === "tsp") {
+                    try {
+                        const poolCategories = ["GEN", "OBC", "MBC", "EWS"];
+                        const promises = poolCategories.map(cat => {
+                            const poolUrl = `${API_BASE_DATA}/api/merit/result?dataset=${datasetKey}&mode=${mode}&category=${encodeURIComponent(cat)}&start=1&end=${stateRank}&emask=0&exclude=&include_overlap=1`;
+                            return fetch(poolUrl).then(r => r.json());
+                        });
+
+                        const poolResults = await Promise.all(promises);
+                        tspOpenPoolData = {};
+
+                        poolResults.forEach(res => {
+                            if (res.ok && res.cat_counts) {
+                                for (let key in res.cat_counts) {
+                                    tspOpenPoolData[key] = (tspOpenPoolData[key] || 0) + (res.cat_counts[key] || 0);
+                                }
+                            }
+                        });
+                    } catch (poolErr) {
+                        console.error("TSP Pool Error", poolErr);
+                    }
+                }
+
+                const finalResponse = {
+                    ok: true,
+                    provider: "ApniRank Cloudflare Engine",
+                    timestamp: new Date().toISOString(),
+                    data: {
+                        candidate: cleanCandidate,
+                        analysisContext: {
+                            examResultCode: examResultCode,
+                            datasetKey: datasetKey,
+                            mode: mode,
+                            rangeEnd: stateRank
+                        },
+                        counts: {
+                            allCategoriesAhead: data2.all_counts,
+                            ownCategoryAhead: data2.cat_counts,
+                            tspOpenPoolAhead: tspOpenPoolData
+                        }
+                    }
+                };
+
+                return new Response(JSON.stringify(finalResponse), {
+                    status: 200,
+                    headers: { "Content-Type": "application/json", ...corsHeaders }
+                });
+
+            } catch (error) {
+                return new Response(JSON.stringify({ ok: false, error: error.message || "Internal Server Error" }), {
+                    status: 500,
+                    headers: { "Content-Type": "application/json", ...corsHeaders }
+                });
+            }
+        }
+
+        // अगर कोई गलत URL हिट करे
+        return new Response(JSON.stringify({ error: "Endpoint not found" }), { 
+            status: 404, headers: { "Content-Type": "application/json", ...corsHeaders } 
+        });
+    }
+};
